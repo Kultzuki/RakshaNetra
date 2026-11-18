@@ -1,0 +1,137 @@
+"""Verify approved artifacts and optionally run real CUDA inference."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from core.model_security import download_verified, file_sha256
+from core.gpu import cuda_device_name, require_cuda
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="fetch missing artifacts from configured HTTPS URLs",
+    )
+    parser.add_argument("--inference", action="store_true")
+    parser.add_argument("--device", type=cuda_device_name, default="cuda")
+    parser.add_argument(
+        "--auxiliary",
+        action="store_true",
+        help="download and check the pinned surveillance and fire models",
+    )
+    args = parser.parse_args(argv)
+    manifest = json.loads((ROOT / "models/manifest.json").read_text())
+    paths = {}
+    for name, item in manifest.items():
+        path = ROOT / name
+        if not path.is_file() and args.download:
+            url = os.environ.get(item["url_env"], "")
+            if not url.startswith("https://"):
+                raise RuntimeError(
+                    f"missing approved model: configure {item['url_env']}"
+                )
+            path = Path(
+                download_verified(
+                    url, ROOT / name, item["sha256"], max_bytes=512 * 1024 * 1024
+                )
+            )
+        if not path.is_file() or file_sha256(path) != item["sha256"]:
+            raise RuntimeError(f"missing or mismatched model: {name}")
+        paths[name] = str(path)
+        print(f"verified {name}")
+    auxiliary = None
+    if args.auxiliary:
+        from core.threat_detection import AUXILIARY_MODELS, SurveillanceThreatDetector
+
+        auxiliary = SurveillanceThreatDetector(
+            download_missing=True, device=args.device, imgsz=320
+        )
+        for source, artifact in AUXILIARY_MODELS.items():
+            auxiliary_path = auxiliary._resolve_weight(source)
+            if not auxiliary_path or file_sha256(auxiliary_path) != artifact.sha256:
+                raise RuntimeError(
+                    f"missing or mismatched pinned auxiliary model: {source}"
+                )
+            auxiliary.weights[source] = auxiliary_path
+            print(f"verified pinned {source} model")
+        auxiliary.download_missing = False
+    if args.inference:
+        import numpy as np
+        import torch
+        from core.stgcn_adapter import STGCNPPAdapter, preprocess_pair
+        from core.demo import pair_history_fixture
+        from hashlib import sha256
+        from core.detector import Detector
+
+        require_cuda(args.device)
+        adapter = STGCNPPAdapter(device=args.device)
+        adapter.load_model(paths["models/stgcnpp/best_fight_stgcnpp_v1.pth"])
+        if not adapter.head_trained:
+            raise RuntimeError("approved fight model has no trained head")
+        tensor = np.zeros((1, 2, 100, 17, 3), dtype=np.float32)
+        first = adapter.predict_batch(tensor)
+        second = adapter.predict_batch(tensor)
+        np.testing.assert_allclose(first, second, rtol=0, atol=1e-6)
+        if not all(np.isfinite(p) and 0 <= p <= 1 for p in first):
+            raise RuntimeError("invalid model probabilities")
+        detector = Detector(
+            pose_model_path=paths["models/yolo/yolo26m-pose.pt"],
+            device=args.device,
+            imgsz=320,
+            load_object_model=False,
+        )
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        detector.detect(frame, timestamp=0)
+        if auxiliary is not None:
+            output = auxiliary.detect(frame)
+            if any(
+                not output.models.get(source, {}).get("ready")
+                for source in auxiliary.weights
+            ):
+                raise RuntimeError(f"auxiliary model check failed: {output.models}")
+            print(
+                f"verified restricted {args.device} inference for surveillance and fire models"
+            )
+        detector.reset()
+        detector.detect(frame, timestamp=0)
+        golden = ROOT / "models/regression.json"
+        expected = json.loads(golden.read_text())
+        np.testing.assert_allclose(
+            first,
+            expected["zero_tensor_probabilities"],
+            rtol=0,
+            atol=expected["absolute_tolerance"],
+        )
+        pair_tensor = preprocess_pair(pair_history_fixture(), 4, 100, img_hw=(240, 320))
+        if sha256(pair_tensor.tobytes()).hexdigest() != expected["pair_tensor_sha256"]:
+            raise RuntimeError("pair preprocessing regression")
+        pair_scores = adapter.predict_batch(pair_tensor[np.newaxis])
+        np.testing.assert_allclose(
+            pair_scores,
+            expected["pair_probabilities"],
+            rtol=0,
+            atol=expected["absolute_tolerance"],
+        )
+        print(
+            json.dumps(
+                {
+                    "inference": "passed",
+                    "device": args.device,
+                    "zero_tensor_probabilities": first,
+                    "torch": torch.__version__,
+                }
+            )
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
